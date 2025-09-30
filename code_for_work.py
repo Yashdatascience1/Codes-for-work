@@ -65,14 +65,14 @@ def compare_dataframe_columns(*dataframes, names=None, print_results=True):
         print("=" * 60)
         print("DATAFRAME COLUMN COMPARISON RESULTS")
         print("=" * 60)
+        print()
         
         for df_name, unique_cols in unique_columns.items():
             if unique_cols:
-                print(f"\n{df_name} has {len(unique_cols)} unique column(s):")
-                print(f"  {unique_cols}")
+                print(f"{df_name} has {unique_cols} which are not present in other dataframes")
             else:
-                print(f"\n{df_name} has no unique columns")
+                print(f"{df_name} has no unique columns")
         
-        print("\n" + "=" * 60)
+        print("=" * 60)
     
     return unique_columns
