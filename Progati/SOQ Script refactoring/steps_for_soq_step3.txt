@@ -1,0 +1,43 @@
+Step 1 - Load the forecast table 
+
+Step 2 - In the forecast table, do following : 
+         1. Convert MONTH_OF_SALE to DATE type column
+		 2. Extract dealer code from PARENT_DEALER_CODE_MODEL_FAMILY 
+		 3. Extract everything after DEALER_CODE and save it as a column called as UNIQUE_FAMILY_CODE
+		 4. Finally, I would want - all the columns that were available in the forecast table and the PARENT_DEALER_CODE & UNIQUE_FAMILY_CODE
+
+Step 3 - Load the parent dealer view table - FIVETRAN_DATABASE.ORACLE_LDP_OLAP_SCHEMA.WC_INT_ORG_DH
+		 1. Make sure X_DEALER_CODE_HIER is not null
+		 2. The final X_DEALER_CODE_HIER will be renamed as DEALER_CODE 
+		 3. From the PAR_ORG_NAME, split the string at "-" and extract the first selected string, that will be the PARENT_DEALER_CODE
+		 4. Finally, the table will have DEALER_CODE and PARENT_DEALER_CODE 
+		 5. Take a distinct of it
+		 
+
+Step 4 - Load the SKU_SUPERCEDENCE_TABLE which is - MOP_DATABASE.SOQ.SKU_SUPERCEDENCE_MODEL_FAMILY_FEB_2025_UPDATED_V2
+         1. Objective is to only keep the active SKUs. 
+		 2. Keep the sku_supercedence table - Rename the UNIQUE FAMILY CODE to UNIQUE_FAMILY_CODE and drop the UPDATEDON column
+		 3. Apply a filter on SKUSTATUS to only keep the rows where SKUSTATUS column is "active". Need to check if there are other 
+		 variations of this string active
+		 4. From active_skus table obtained in Step 2, check for the number of SKUs attached for each UNIQUE FAMILY CODE, 
+		 ideally there should be a column in active_skus table 
+
+
+Step 5 - Load the ECR table which is - ANALYTICS_DATABASE.ANALYTICS_SALES.CUSTOMER_RETAILS
+		 1. Filter the results only for Individual type of customers 
+		 2. Since my forecast starts from January 2026, so for disaggregating the January forecast results, 
+		 I would need the sales for the last 3 months - October, November, and December. So, I would need sales from October till March
+		 3. I will calculate the NET_SALES - by adding INVOICED_SALES, CANCELLED_SALES, and RETURNED_SALES
+		 4. SKU_SUPERCEDENCE_TABLE (for all SKU not only active SKUs) is joined with ECR table on SKU and MODEL
+		    I will only select SKU, MODEL, and UNIQUE_FAMILY_CODE from SKU_SUPERCEDENCE_TABLE and left (ecr table on the left)
+			join it with ECR table to 
+			The output of the above step is further "left joined (with output of the above step on the left) 
+			with parent_dealer table obtained in Step 3, here join is made on DEALER_CODE 
+			
+
+Step 6 - Load the OBD Mapping table which is MOP_DATABASE.SOQ.OBD2_MAPPING_VIEW 
+		 1. Rename the PREVIOUS_OBD_SKU column in OBD_TABLE to SKU 
+		 2. Left join (with ecr on left) with OBD_TABLE on "SKU" column, basically idea is if an SKU is existent in OBD table 
+		 it should be replaced with its current obd sku and if it is not then simply use the previous SKU 
+ 
+		 
