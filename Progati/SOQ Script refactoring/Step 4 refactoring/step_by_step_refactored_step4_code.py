@@ -65,6 +65,19 @@ NULL_LEAD_TIME_TABLE = 'MOP_DATABASE.SOQ.NULL_LEAD_TIME'
 # Input: end-of-journey (discontinuation) recommendations per SKU
 END_JOURNEY_TABLE = 'MOP_DATABASE.SOQ.END_OF_JOURNEY_RECOMMENDATION'
 
+# ─────────────────────────────────────────────────────────────────────────────
+# BUG 5 FIX — DEMAND_VARIABILITY unit flag
+# Set to True  if DEMAND_VARIABILITY is an absolute std deviation (same units
+#              as sales volume — pieces, units, etc.)
+# Set to False if DEMAND_VARIABILITY is a CV (coefficient of variation,
+#              unitless ratio: std_dev / mean). In that case the formula
+#              multiplies CV × PREDICTED_SALES_SKU to get units-consistent
+#              standard deviation before applying Z and sqrt scaling.
+# Wrong setting here silently produces incorrect safety stock — verify against
+# your upstream variability table's documentation before running.
+# ─────────────────────────────────────────────────────────────────────────────
+DEMAND_VARIABILITY_IS_ABSOLUTE = True  # <-- verify this against your data
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 3 — ABC helper function
@@ -147,7 +160,19 @@ def calculate_soq(
     # Left join in both cases:
     #   - Preserves all base rows even if no variability record exists
     #   - Unmatched rows get null → coalesced to 1.0 (neutral — no amplification)
+    #
+    # BUG 3 FIX — Duplicate column collision:
+    #   The variability tables share column names with the base table
+    #   (PLANNING_MONTH, RUN_DATE, RUN_VERSION). Snowpark does not
+    #   deduplicate on join — duplicate names cause ambiguous reference
+    #   errors downstream. Fix: drop shared columns from the right-hand
+    #   table before joining, since they are redundant (already filtered on).
     # ─────────────────────────────────────────────────────────────────────────
+
+    # Columns present in both tables that are not part of the join key —
+    # must be dropped from the right side before joining to avoid duplicates.
+    SHARED_NON_KEY_COLS = ['RUN_DATE', 'RUN_VERSION']
+
     if sku_demand_variability:
 
         demand_var = (
@@ -157,6 +182,9 @@ def calculate_soq(
             .filter(F.col('RUN_VERSION')    == F.lit(run_version))
             .filter(F.col('IS_OBD')         == F.lit(OBD_FLAG))
             .drop('IS_OBD')
+            # BUG 3 FIX: drop columns that also exist in soq_base but are
+            # not part of the join key — prevents duplicate column names post-join
+            .drop(*SHARED_NON_KEY_COLS)
         )
 
         # SKU included in join key — each SKU gets its own variability value
@@ -185,6 +213,8 @@ def calculate_soq(
             .filter(F.col('RUN_VERSION')    == F.lit(run_version))
             .filter(F.col('IS_OBD')         == F.lit(OBD_FLAG))
             .drop('IS_OBD')
+            # BUG 3 FIX: same as above — drop shared non-key columns
+            .drop(*SHARED_NON_KEY_COLS)
         )
 
         # SKU NOT in join key — all SKUs in the same family inherit the
@@ -310,7 +340,14 @@ def calculate_soq(
     # stock cannot be calculated and the SOQ would be incomplete.
     # Rows with null lead time are saved separately for investigation,
     # then dropped from the main pipeline.
-    # Overwrite mode: null lead time table reflects the current run only.
+    #
+    # BUG 2 FIX — Null lead time table always overwrites:
+    #   calculate_soq is called 10 times per month-period (5 service levels
+    #   × 2 variability modes). Overwrite mode means each call wipes the
+    #   previous call's null rows — a later call with zero nulls clears the
+    #   table entirely.
+    #   Fix: switch to append mode and tag each row with SERVICE_LEVEL and
+    #   DEMAND_VARIABILITY_TYPE so you can filter by specific run when investigating.
     # ─────────────────────────────────────────────────────────────────────────
 
     # Separate rows with null MAX_LEAD_TIME
@@ -318,8 +355,15 @@ def calculate_soq(
     null_count          = null_lead_time_rows.count()
 
     if null_count > 0:
-        # Save to investigation table before dropping
-        null_lead_time_rows.write.mode('overwrite').save_as_table(NULL_LEAD_TIME_TABLE)
+        # BUG 2 FIX: tag rows with run context before appending
+        null_lead_time_rows = (
+            null_lead_time_rows
+            .with_column('SERVICE_LEVEL',          F.lit(service_level))
+            .with_column('DEMAND_VARIABILITY_TYPE', F.col('DEMAND_VARIABILITY_TYPE'))
+            .with_column('CAPTURED_AT',            F.lit(run_date))
+        )
+        # BUG 2 FIX: append instead of overwrite — preserves rows from all 10 calls
+        null_lead_time_rows.write.mode('append').save_as_table(NULL_LEAD_TIME_TABLE)
 
     # Continue with only rows that have a valid lead time
     data = data.filter(F.col('MAX_LEAD_TIME').is_not_null())
@@ -374,9 +418,20 @@ def calculate_soq(
     #                            safety stock covers 95% of demand spike scenarios
     #   F.ceil                 : always round up
     #
+    # BUG 5 FIX — DEMAND_VARIABILITY unit assumption:
+    #   If DEMAND_VARIABILITY is a CV (std_dev / mean, unitless), multiplying
+    #   it directly by sqrt and Z gives a result in the wrong units — the cap
+    #   of 3 × PREDICTED_SALES_SKU (in pieces) is then comparing apples to
+    #   oranges, and safety stock will be massively overstated for volatile
+    #   low-volume SKUs.
+    #   Fix: when DEMAND_VARIABILITY_IS_ABSOLUTE = False, convert CV back to
+    #   absolute std deviation first by multiplying by PREDICTED_SALES_SKU
+    #   before applying the Z and sqrt scaling.
+    #   Verify DEMAND_VARIABILITY_IS_ABSOLUTE against your upstream table docs.
+    #
     # Cap at 3× monthly predicted sales:
     #   Prevents extreme safety stock on very volatile but low-volume SKUs
-    #   where the formula can produce unrealistically large numbers
+    #   where the formula can produce unrealistically large numbers.
     #
     # Coalesce to 0 after cap:
     #   Safe fallback in case PREDICTED_SALES_SKU was null (cap produces null)
@@ -388,15 +443,30 @@ def calculate_soq(
     # Resolve Z-score for this service level from config
     z = Z_SCORE[service_level]
 
+    if DEMAND_VARIABILITY_IS_ABSOLUTE:
+        # DEMAND_VARIABILITY is already in units of sales (pieces, units, etc.)
+        # Use directly in the formula — no conversion needed
+        raw_safety_stock = (
+            F.col('DEMAND_VARIABILITY')
+            * F.sqrt(F.col('SAFETY_STOCK_DAYS') / F.lit(30))
+            * F.lit(z)
+        )
+    else:
+        # DEMAND_VARIABILITY is a CV (unitless ratio: std_dev / mean)
+        # Convert to absolute std deviation first: CV × mean (PREDICTED_SALES_SKU)
+        # Then apply Z and sqrt scaling — result is now in units of sales
+        raw_safety_stock = (
+            F.col('DEMAND_VARIABILITY')
+            * F.col('PREDICTED_SALES_SKU')
+            * F.sqrt(F.col('SAFETY_STOCK_DAYS') / F.lit(30))
+            * F.lit(z)
+        )
+
     data = data.with_column(
         'SAFETY_STOCK',
         F.least(
             # Uncapped safety stock
-            F.ceil(
-                F.col('DEMAND_VARIABILITY')
-                * F.sqrt(F.col('SAFETY_STOCK_DAYS') / F.lit(30))
-                * F.lit(z)
-            ),
+            F.ceil(raw_safety_stock),
             # Cap: safety stock cannot exceed 3× monthly predicted SKU sales
             F.col('PREDICTED_SALES_SKU') * F.lit(3)
         )
@@ -495,10 +565,19 @@ def calculate_soq(
     # Done last — after all business logic — so these columns don't interfere
     # with any joins or calculations above.
     # Allows any output row to be fully traced and reproduced.
+    #
+    # BUG 1 FIX — ABC column overwrite:
+    #   The original code overwrote the per-row ABC classification ('A'/'B'/'C')
+    #   computed in Step 7 with the audit config string ("A 30, B 25, C 20").
+    #   Step 8's safety stock math ran before this so the numbers were correct,
+    #   but the output ABC column was useless for filtering or reporting.
+    #   Fix: store the audit string under a separate column ABC_CONFIG.
+    #   ABC in the output now correctly holds the per-row classification.
     # ─────────────────────────────────────────────────────────────────────────
     data = (
         data
-        .with_column('ABC',           F.lit(STR_ABC))       # ABC thresholds used in this run
+        # BUG 1 FIX: renamed from 'ABC' to 'ABC_CONFIG' — preserves per-row ABC
+        .with_column('ABC_CONFIG',    F.lit(STR_ABC))       # ABC thresholds used in this run
         .with_column('Z_SCORE',       F.lit(z))             # Z-score for this service level
         .with_column('SERVICE_LEVEL', F.lit(service_level)) # service level %
         .with_column('RUN_DATE',      F.lit(run_date))      # date this run was executed
@@ -515,6 +594,15 @@ def calculate_soq(
     # Left join: SOQ rows with no end-of-journey record get a null flag.
     # This is enrichment only — not used in any SOQ calculation above.
     # Done last so it doesn't interfere with any business logic.
+    #
+    # BUG 4 FIX — EOJ join fan-out:
+    #   If the same SKU appears more than once in END_JOURNEY_TABLE on the
+    #   max run date (e.g. different dealers or families), joining on SKU
+    #   alone fans out — one input row produces multiple output rows,
+    #   silently inflating the dataset.
+    #   Fix: deduplicate END_JOURNEY_TABLE to one row per SKU before joining.
+    #   If multiple recommendations exist for the same SKU, take the most
+    #   conservative one (RECOMMEND_END_OF_JOURNEY = 'Y' takes priority).
     # ─────────────────────────────────────────────────────────────────────────
 
     # Collect the max run date from the end-of-journey table
@@ -525,10 +613,17 @@ def calculate_soq(
                .collect()[0][0]
     )
 
+    # BUG 4 FIX: deduplicate to one row per SKU before joining.
+    # Priority: if any record for a SKU recommends end-of-journey ('Y'),
+    # that recommendation wins — most conservative outcome.
     end_journey = (
         session.table(END_JOURNEY_TABLE)
         .filter(F.col('RUN_DATE') == F.lit(max_eoj_run_date))
         .select('SKU', 'RECOMMEND_END_OF_JOURNEY')
+        # Group by SKU — take 'Y' if any record recommends end-of-journey,
+        # otherwise take whatever value exists (max of 'Y'/'N' = 'Y')
+        .group_by('SKU')
+        .agg(F.max('RECOMMEND_END_OF_JOURNEY').alias('RECOMMEND_END_OF_JOURNEY'))
     )
 
     # Left join on SKU — unmatched SKUs get null RECOMMEND_END_OF_JOURNEY
